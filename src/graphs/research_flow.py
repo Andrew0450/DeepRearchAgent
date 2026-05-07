@@ -39,6 +39,9 @@ class ResearchFlowState(TypedDict):
     # Node 1 输出
     parsed: Optional[dict]
 
+    # 多任务检测
+    multi_topic: Optional[List[str]]  # 检测到多个任务时，填入任务列表
+
     # Node 2 输出
     collected_data: Optional[str]
 
@@ -112,7 +115,7 @@ def _run_multi_searches(queries: List[str], sites: str = None, time_range: str =
 # Node 1: 主题解析
 # ============================================================================
 
-_TOPIC_PARSER_PROMPT = """你是调研主题解析器。请分析用户给出的调研主题，输出结构化信息。
+_TOPIC_PARSER_PROMPT = """你是调研主题解析器。请分析用户给出的调研主题，检测是否包含多个独立任务，并输出结构化信息。
 
 ## 输入
 - 主题：{topic}
@@ -120,9 +123,14 @@ _TOPIC_PARSER_PROMPT = """你是调研主题解析器。请分析用户给出的
 - 用户额外要求：{extra_requirements}
 
 ## 任务
-1. 将模糊主题转化为1-3个明确的调研问题
-2. 如果用户没有指定方向，判断最合适的方向
-3. 生成搜索用的关键词列表
+1. 【多任务检测】检查主题是否包含多个独立调研任务
+   - 触发条件：包含"和""与""+""、"、"或"等连接词，或用顿号、换行符分隔
+   - 示例1："人形机器人产业和低空经济" → 两个任务
+   - 示例2："竞品分析+政策研究" → 两个任务
+   - 示例3："技术方案调研" → 一个任务
+2. 将每个任务转化为明确的调研问题
+3. 如果用户没有指定方向，判断最合适的方向（每个任务可以不同）
+4. 生成搜索用的关键词列表
 
 ## 方向判断规则
 - 包含"技术""方案""设计""实现""仿真""复现" → A
@@ -134,11 +142,52 @@ _TOPIC_PARSER_PROMPT = """你是调研主题解析器。请分析用户给出的
 
 ## 输出格式（严格JSON，不要输出其他内容）
 
+// 如果检测到多个任务：
 {{
-  "questions": ["调研问题1", "调研问题2", "调研问题3"],
-  "direction": "A",
+  "is_multi_topic": true,
+  "topics": [
+    {{
+      "topic": "任务1具体主题",
+      "direction": "B1",
+      "direction_reason": "判断理由",
+      "template": "B1",
+      "search_keywords": {{
+        "primary": ["核心关键词1"],
+        "secondary": ["补充关键词1"],
+        "english": ["English keyword 1"]
+      }},
+      "scope": {{
+        "time_range": "近3年",
+        "depth": "standard",
+        "focus_areas": ["重点关注领域"]
+      }}
+    }},
+    {{
+      "topic": "任务2具体主题",
+      "direction": "E",
+      "direction_reason": "判断理由",
+      "template": "E",
+      "search_keywords": {{
+        "primary": ["核心关键词2"],
+        "secondary": ["补充关键词2"],
+        "english": []
+      }},
+      "scope": {{
+        "time_range": "近3年",
+        "depth": "standard",
+        "focus_areas": ["重点关注领域"]
+      }}
+    }}
+  ]
+}}
+
+// 如果只有一个任务：
+{{
+  "is_multi_topic": false,
+  "questions": ["调研问题1", "调研问题2"],
+  "direction": "B1",
   "direction_reason": "判断理由",
-  "template": "A1",
+  "template": "B1",
   "search_keywords": {{
     "primary": ["核心关键词1", "核心关键词2"],
     "secondary": ["补充关键词1", "补充关键词2"],
@@ -153,7 +202,7 @@ _TOPIC_PARSER_PROMPT = """你是调研主题解析器。请分析用户给出的
 
 
 def topic_parser(state: ResearchFlowState, llm: ChatOpenAI) -> dict:
-    """解析主题，输出结构化信息"""
+    """解析主题，输出结构化信息（支持多任务检测）"""
     topic = state["topic"]
     direction = state.get("direction", "")
     extra = state.get("extra_requirements", "")
@@ -181,9 +230,20 @@ def topic_parser(state: ResearchFlowState, llm: ChatOpenAI) -> dict:
         if direction and direction.strip():
             parsed["direction"] = direction.strip()
 
+        # 检测多任务
+        is_multi = parsed.get("is_multi_topic", False)
+        if is_multi:
+            topics_list = parsed.get("topics", [])
+            topic_names = [t.get("topic", "") for t in topics_list]
+            logger.info(f"检测到多任务: {topic_names}")
+            return {
+                "parsed": parsed,
+                "multi_topic": topic_names,
+            }
+
         logger.info(f"主题解析完成: direction={parsed.get('direction')}, "
                     f"questions={parsed.get('questions')}")
-        return {"parsed": parsed}
+        return {"parsed": parsed, "multi_topic": None}
 
     except Exception as e:
         logger.error(f"主题解析失败: {e}")
@@ -206,6 +266,7 @@ def topic_parser(state: ResearchFlowState, llm: ChatOpenAI) -> dict:
                     "focus_areas": [],
                 },
             },
+            "multi_topic": None,
             "error": f"主题解析异常，已降级处理: {str(e)}",
         }
 
@@ -428,115 +489,98 @@ _SEARCH_QUERIES_E = [
 
 
 # ============================================================================
-# 结构化提取 Prompt（B1/B2 专用，强制 JSON 输出）
+# 全局结构化提取 Prompt（所有方向通用）
+# 强制从采集文本中提取：市场数据、竞品、政策、技术、学术等所有方向的关键数据
 # ============================================================================
 
-# B1 行业驱动 - 强制结构化提取
-_EXTRACT_B1 = """你是一个严格的数据提取机器人。你的任务是从原始搜索文本中提取关键数据，并严格按JSON格式输出。
+_EXTRACT_GLOBAL = """你是结构化数据提取器。请从以下采集文本中，提取所有能找到的结构化数据。
 
-## 铁律
-1. 只从搜索文本中提取数据，绝不编造
-2. 搜索文本中没有的字段，值设为 null
-3. 数字必须精确，字符串必须简洁
-4. 每条数据必须附来源URL
+## 重要原则
+- **宁可多提取，不可漏提**：如果搜索结果中出现了具体数字、表格、排名、政策名称、产品参数，务必提取
+- **严格基于文本**：只提取文本中实际存在的数据，不编造、不推测
+- **未找到标注"未找到"**：某个字段在文本中完全没有提及时，写"未找到"
+- **保留来源**：每个数据项必须附上来源 URL
 
-## 输出格式（必须严格按此JSON输出，不要有任何额外文字）
+## 要提取的字段（全部方向适用，按实际内容提取，不全有）
+
 ```json
 {{
-  "market_data": [
-    {{
-      "year": "2021",
-      "global_size": "xx亿元/亿美元",
-      "china_size": "xx亿元",
-      "growth_rate": "+/-xx%",
-      "source": "[来源名称](URL)"
-    }}
-  ],
+  "market_data": {{
+    "yearly_data": [
+      {{
+        "year": "年份",
+        "global_size": "全球市场规模（含单位）",
+        "china_size": "中国市场规模（含单位）",
+        "global_shipment": "全球出货量（含单位）",
+        "china_shipment": "中国出货量（含单位）",
+        "growth_rate": "同比增长率",
+        "source": "[来源名称](URL)"
+      }}
+    ]
+  }},
   "competitive_products": [
     {{
-      "name": "产品名",
-      "price": "价格",
-      "core_specs": "核心参数",
-      "pros": "优势",
-      "cons": "劣势",
-      "rating": "评级",
+      "name": "产品/竞品名称",
+      "price": "价格（含单位）",
+      "key_specs": "关键参数（可多行）",
+      "advantages": "主要优势",
+      "disadvantages": "主要劣势",
+      "rating": "综合评级",
+      "target_users": "目标用户",
       "source": "[来源名称](URL)"
     }}
   ],
   "pain_points": [
     {{
-      "type": "技术瓶颈/成本压力/人才短缺/商业化难",
-      "description": "具体描述",
-      "evidence": "数据或案例",
-      "severity": "高/中/低",
+      "type": "痛点类型（技术/成本/政策/用户适配/市场竞争等）",
+      "problem": "具体问题描述",
+      "evidence": "证据（具体数据或用户反馈）",
+      "severity": "严重程度（高/中/低）",
+      "current_solution": "现有解决方案及效果",
+      "unresolved_reason": "未解决的根本原因",
       "source": "[来源名称](URL)"
     }}
   ],
-  "industry_drivers": ["驱动因素1", "驱动因素2"],
-  "supply_chain": ["上游:企业1", "中游:企业2", "下游:企业3"],
-  "key_companies": ["企业1", "企业2"],
-  "trends": ["趋势1", "趋势2"],
-  "sources": ["[来源1](URL1)", "[来源2](URL2)"]
+  "policies": [
+    {{
+      "name": "政策名称",
+      "issued_by": "发布机构",
+      "date": "发布时间",
+      "key_content": "核心内容",
+      "impact": "对行业的影响",
+      "source": "[来源名称](URL)"
+    }}
+  ],
+  "technical_specs": [
+    {{
+      "category": "技术类别（硬件/算法/材料等）",
+      "spec": "具体技术指标或方案",
+      "advantage": "优势",
+      "limitation": "局限性",
+      "maturity": "成熟度（实验/小规模/成熟）",
+      "source": "[来源名称](URL)"
+    }}
+  ],
+  "academic_papers": [
+    {{
+      "title": "论文标题",
+      "authors": "作者",
+      "year": "年份",
+      "journal": "期刊/会议",
+      "core_method": "核心方法",
+      "innovation": "创新点",
+      "reproducibility": "可复现性评估",
+      "url": "URL"
+    }}
+  ],
+  "upstream_components": ["核心上游供应商/技术1", "核心上游供应商/技术2"],
+  "downstream_applications": ["下游应用场景1", "下游应用场景2"],
+  "industry_overview": "一句话行业概述",
+  "notable_findings": ["其他值得关注的发现1", "其他值得关注的发现2"]
 }}
 ```
 
-## 原始搜索文本（只提取，不要改写）
-{raw_text}
-"""
-
-
-# B2 产品驱动 - 强制结构化提取
-_EXTRACT_B2 = """你是一个严格的数据提取机器人。你的任务是从原始搜索文本中提取关键数据，并严格按JSON格式输出。
-
-## 铁律
-1. 只从搜索文本中提取数据，绝不编造
-2. 搜索文本中没有的字段，值设为 null
-3. 数字必须精确，字符串必须简洁
-4. 每条数据必须附来源URL
-
-## 输出格式（必须严格按此JSON输出，不要有任何额外文字）
-```json
-{{
-  "product_definition": "产品定义",
-  "direct_market": {{
-    "current": "当前市场规模",
-    "yearly_data": [
-      {{
-        "year": "2024",
-        "global_size": "xx亿元",
-        "china_size": "xx亿元",
-        "growth": "+xx%",
-        "source": "[来源](URL)"
-      }}
-    ]
-  }},
-  "product_pain_points": [
-    {{
-      "problem": "具体问题",
-      "impact": "影响范围",
-      "severity": "高/中/低",
-      "current_solution": "现有解决方案及效果",
-      "unresolved_reason": "未解决原因",
-      "source": "[来源](URL)"
-    }}
-  ],
-  "competing_products": [
-    {{
-      "name": "竞品名",
-      "price": "价格",
-      "key_specs": "关键参数",
-      "market_position": "市场定位",
-      "source": "[来源](URL)"
-    }}
-  ],
-  "upstream": ["核心供应商1", "核心供应商2"],
-  "downstream": ["下游客户类型"],
-  "policies": ["相关政策"],
-  "sources": ["[来源1](URL1)"]
-}}
-```
-
-## 原始搜索文本（只提取，不要改写）
+## 待分析文本
 {raw_text}
 """
 
@@ -625,13 +669,15 @@ def collect_data(state: ResearchFlowState, llm: ChatOpenAI) -> dict:
 
 def _do_structured_extraction(llm: ChatOpenAI, direction: str,
                                prose_data: str, raw_search: str) -> str:
-    """强制从采集数据中提取关键结构化字段，确保不遗漏竞品表格和年份数据"""
-    extract_prompt = _EXTRACT_B1 if direction == "B1" else _EXTRACT_B2
+    """强制从采集数据中提取关键结构化字段（全局通用，所有方向适用）
+
+    提取：市场数据、竞品、政策、技术、学术、痛点等所有方向的关键数据。
+    """
     # 优先用 prose_data（已有LLM提取），raw_search兜底
     raw_text = prose_data if len(prose_data) > 200 else raw_search
     raw_text = raw_text[:8000]  # 控制token
 
-    prompt = extract_prompt.format(raw_text=raw_text)
+    prompt = _EXTRACT_GLOBAL.format(raw_text=raw_text)
     try:
         response = llm.invoke([HumanMessage(content=prompt)])
         raw = response.content if isinstance(response.content, str) else str(response.content)
@@ -641,6 +687,7 @@ def _do_structured_extraction(llm: ChatOpenAI, direction: str,
             lines = raw.splitlines()
             raw = "\n".join(lines[1:]) if len(lines) > 2 else raw
             raw = raw.replace("```json", "").replace("```", "").strip()
+        logger.info("结构化提取完成（全局通用）")
         return raw
     except Exception as e:
         logger.warning(f"结构化提取失败（不影响主流程）: {e}")
