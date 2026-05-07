@@ -12,11 +12,22 @@ from coze_coding_utils.runtime_ctx.context import new_context
 logger = logging.getLogger(__name__)
 
 
-def _to_safe_filename(text: str) -> str:
+def _to_safe_filename(topic: str, direction: str = "") -> str:
     """将中文主题转换为安全的英文文件名"""
-    import hashlib
+    from datetime import datetime
 
-    # 基础英文词映射
+    # 方向映射
+    direction_map = {
+        "A": "A_tech",
+        "B1": "B1_industry",
+        "B2": "B2_product",
+        "C": "C_academic",
+        "D": "D_competitor",
+        "E": "E_policy",
+    }
+    dir_code = direction_map.get(direction.upper(), "report")
+
+    # 主题词映射（常见主题）
     topic_map = {
         "人形机器人": "humanoid_robot",
         "智能眼镜": "smart_glasses",
@@ -26,21 +37,30 @@ def _to_safe_filename(text: str) -> str:
         "大模型": "llm",
         "自动驾驶": "autonomous_driving",
         "半导体": "semiconductor",
+        "量子计算": "quantum_computing",
+        "脑机接口": "brain_computer",
     }
 
-    # 尝试匹配已知主题
+    # 匹配已知主题
+    topic_code = None
     for cn, en in topic_map.items():
-        if cn in text:
-            return en
+        if cn in topic:
+            topic_code = en
+            break
 
-    # 未知主题：用拼音首字母 + 哈希
-    slug = re.sub(r"[^\w]", "_", text)[:20]
-    safe = re.sub(r"_+", "_", slug).strip("_")
-    if safe.encode("utf-8").isascii():
-        return safe
-    # 非ASCII：用时间戳哈希
-    ts = int(time.time())
-    return f"report_{ts % 100000:05d}"
+    if topic_code is None:
+        # 未知主题：取前12字符的拼音+哈希前6位
+        slug = re.sub(r"[^\w]", "_", topic)[:12]
+        slug = re.sub(r"_+", "_", slug).strip("_")
+        if slug.encode("utf-8").isascii():
+            topic_code = slug
+        else:
+            # 用时间戳哈希前6位
+            ts = int(time.time())
+            topic_code = f"topic_{ts % 1000000:06d}"
+
+    date_str = datetime.now().strftime("%Y%m%d")
+    return f"RF_{dir_code}_{topic_code}_{date_str}"
 
 
 @tool
@@ -48,6 +68,7 @@ def generate_report_document(
     report_content: str,
     topic: str,
     doc_format: str = "docx",
+    direction: str = "",
 ) -> str:
     """将调研报告内容生成可下载的文档文件。
 
@@ -58,6 +79,7 @@ def generate_report_document(
         report_content: 调研报告的完整 Markdown 内容（从 run_research_flow 返回值中提取第一部分）
         topic: 调研主题，用于生成文件名（如"人形机器人产业"）
         doc_format: 文档格式，默认为 "docx"（也支持 "pdf"）
+        direction: 调研方向代码（A/B1/B2/C/D/E），用于生成规范的文件名
 
     返回:
         文件下载链接（24小时内有效），返回格式：'📎 文档已生成：[格式]下载 | 报告标题 | 下载链接'
@@ -90,8 +112,8 @@ def generate_report_document(
     )
     cleaned = cleaned.strip()
 
-    # 生成安全的文件名
-    filename = _to_safe_filename(topic)
+    # 生成安全的文件名（包含方向和日期）
+    filename = _to_safe_filename(topic, direction)
 
     try:
         url = client.create_docx_from_markdown(cleaned, filename)

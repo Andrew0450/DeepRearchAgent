@@ -144,6 +144,7 @@ def build_agent(ctx=None):
                 doc_result = generate_report_document.invoke({
                     "report_content": full_report_content,
                     "topic": topic,
+                    "direction": direction,
                 })
                 doc_url = doc_result.strip()
                 logger.info(f"文档生成成功: {doc_url[:80]}...")
