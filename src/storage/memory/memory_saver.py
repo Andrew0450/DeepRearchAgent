@@ -1,4 +1,5 @@
 import psycopg
+import warnings
 from psycopg_pool import AsyncConnectionPool
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -9,6 +10,14 @@ import logging
 import time
 
 logger = logging.getLogger(__name__)
+
+# 忽略 AsyncConnectionPool 废弃警告（psycopg_pool 推荐在构造函数中初始化，
+# 但 langgraph 的 AsyncPostgresSaver 已有自己的连接池管理，无需 open() 调用）
+warnings.filterwarnings(
+    "ignore",
+    message="opening the async pool AsyncConnectionPool in the constructor",
+    category=RuntimeWarning,
+)
 
 # 数据库连接超时时间（秒），每次尝试 15 秒，共尝试 2 次
 DB_CONNECTION_TIMEOUT = 15
