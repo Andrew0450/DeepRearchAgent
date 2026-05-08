@@ -12,6 +12,7 @@ ResearchFlow 调研工作流 (LangGraph)
 
 import json
 import logging
+import os
 from typing import TypedDict, Optional, Annotated, List
 from functools import partial
 
@@ -24,6 +25,77 @@ from coze_coding_utils.log.write_log import request_context
 from coze_coding_utils.runtime_ctx.context import new_context
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# 模板文件路径
+# ============================================================================
+_WORKSPACE = os.getenv("COZE_WORKSPACE_PATH", "/workspace/projects")
+_TEMPLATE_DIR = os.path.join(_WORKSPACE, "assets")
+
+
+def _read_template(template_name: str) -> str:
+    """读取模板文件内容，用于引导搜索和提取"""
+    path = os.path.join(_TEMPLATE_DIR, template_name)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        logger.info(f"读取模板文件: {path}, 长度={len(content)}")
+        return content
+    except FileNotFoundError:
+        logger.warning(f"模板文件不存在: {path}")
+        return ""
+    except Exception as e:
+        logger.error(f"读取模板文件失败: {path}, error={e}")
+        return ""
+
+
+def _generate_template_guided_searches(
+    llm, direction: str, topic: str, template_content: str
+) -> List[str]:
+    """基于模板内容生成针对性的搜索查询列表"""
+    if not template_content:
+        return []
+
+    # 截取模板前4000字符（避免超长上下文）
+    template_snippet = template_content[:4000]
+
+    prompt = f"""你是一个专业的研究助手，负责为调研任务生成针对性的搜索查询。
+
+## 调研任务
+- 方向: {direction}
+- 主题: {topic}
+
+## 模板框架（定义了需要收集的数据字段）
+请仔细阅读以下模板，它定义了需要收集的具体数据字段。你需要为每个章节/字段生成1-3条搜索查询：
+
+---
+{template_snippet}
+---
+
+## 任务要求
+1. 根据模板的章节和字段定义，为"主题：{topic}"生成精准的搜索查询
+2. 每条查询要具体（包含产品/公司名或关键指标），不要泛泛而问
+3. 特别关注模板中的"厂商列表"、"出货量"、"市场规模"、"产业链"等数据字段
+4. 生成8-15条搜索查询，覆盖模板的主要章节
+5. 每条查询单独一行，不要加序号，不要解释
+
+直接输出查询列表，每行一条：
+"""
+
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        text = response.content if isinstance(response.content, str) else str(response.content)
+        # 解析：每行一个查询，去除空行和序号
+        queries = []
+        for line in text.strip().split("\n"):
+            line = line.strip().strip("0123456789.、、- ")
+            if line and len(line) > 5:
+                queries.append(line)
+        logger.info(f"模板引导生成搜索查询 {len(queries)} 条")
+        return queries[:15]
+    except Exception as e:
+        logger.error(f"生成模板引导搜索失败: {e}")
+        return []
 
 # ============================================================================
 # State
@@ -404,10 +476,78 @@ _SEARCH_QUERIES_B1 = [
     '{english} market size TAM SAM SOM penetration rate segmentation',
 ]
 
-# ---- B2 方向已合并至 B1 ----
-# 原 B2（产品驱动型）职责已整合进 B1（行业+市场）
-# B2 查询请使用 B1 方向：B1 = 行业分析（值不值得进）+ 市场分析（蛋糕有多大）
-# 产品横向对比见竞品分析方向（D）
+# ---- B2 方向: 市场量化（行业+市场组合的量化部分）----
+# B2 = 市场量化，回答"蛋糕有多大"，专注TAM/SAM/SOM + 历年数据 + 竞争格局数据
+_SEARCH_QUERIES_B2 = [
+    '{primary} 市场规模 全球 中国 TAM SAM SOM 渗透率',
+    '{primary} {primary} 出货量 销量 增长率 年度数据',
+    '{primary} {primary} 竞争格局 市场份额 集中度 头部玩家',
+    '{primary} 细分市场 按产品 按地区 按用户类型',
+    '{primary} 用户画像 需求特征 消费行为 付费意愿',
+    '{primary} 市场预测 CAGR 增长趋势 未来空间',
+    '{english} {english} market size TAM SAM SOM shipment revenue growth rate',
+    '{english} {english} market share concentration leading players competitive landscape',
+]
+
+_PROMPT_B2 = """你是一个专业的市场分析师。请根据搜索结果，为「{topic}」进行市场量化分析。
+
+## 调研主题
+{topic}
+
+## 搜索结果
+{search_results}
+
+## 核心任务
+请从搜索结果中提取以下市场量化数据，填充到对应框架中：
+
+### 一、产品定义与市场边界
+- 产品的明确定义（功能/形态/核心参数）
+- 主要产品形态分类（按价格/场景/技术路线）
+- 目标用户群体画像（年龄/收入/使用场景）
+
+### 二、市场规模（TAM/SAM/SOM）
+请分别用三种方法估算（如果有数据的话）：
+1. **自上而下法**：TAM = 目标用户基数 × 平均客单价 × 年均消费频次
+2. **自下而上法**：SAM = Σ 各细分市场规模（按地区/用户类型拆分）
+3. **类比法**：参考 XX 市场 × 调整系数 = YY 市场
+
+注：不要只给一个数字，要说明估算方法和假设条件
+
+### 三、历年市场规模数据
+请尽可能填写以下年份的市场规模数据（单位：亿元/万美元）：
+| 年份 | 全球市场规模 | 中国市场规模 | 同比增长率 |
+|------|------------|------------|----------|
+| 2020 |            |            |          |
+| 2021 |            |            |          |
+| 2022 |            |            |          |
+| 2023 |            |            |          |
+| 2024 |            |            |          |
+| 2025 |            |            |          |
+| 2026E |          |            |          |
+
+注：数据来源必须标注；若某年数据缺失，写"未给出"并说明可能原因
+
+### 四、竞争格局数据
+- 全球市场：主要玩家名称 + 各自的市场份额
+- 中国市场：主要玩家名称 + 各自的市场份额
+- 市场集中度（CR3/CR5/CR10）
+- 新进入者威胁程度
+
+### 五、用户画像
+- 主力用户群体特征（年龄段/收入水平/使用场景）
+- 核心需求（功能需求/体验需求/情感需求）
+- 付费意愿区间
+
+### 六、关键数据缺口
+列出当前数据中的空白点，标注"数据缺失（建议通过XX渠道补充）"
+
+## 数据质量要求
+- 每条数据必须附来源，格式：[来源名称](URL)
+- 估算值必须标注"⚠️估算值"，并说明计算公式
+- 未给出的数据写"未给出"，不要编造
+- 数据差异过大时，优先采信权威机构数据
+"""
+
 # ---- 方向 C: 学术综述 ----
 _PROMPT_C = """你是学术论文结构化分析器。请梳理研究脉络。
 
@@ -623,6 +763,7 @@ def _build_queries(direction: str, topic: str, keywords: dict) -> List[str]:
     template_map = {
         "A": _SEARCH_QUERIES_A,
         "B1": _SEARCH_QUERIES_B1,
+        "B2": _SEARCH_QUERIES_B2,
         "C": _SEARCH_QUERIES_C,
         "D": _SEARCH_QUERIES_D,
         "E": _SEARCH_QUERIES_E,
@@ -642,6 +783,7 @@ def _build_collection_prompt(direction: str, topic: str, questions: List[str],
     prompt_map = {
         "A": _PROMPT_A,
         "B1": _PROMPT_B1,
+        "B2": _PROMPT_B2,
         "C": _PROMPT_C,
         "D": _PROMPT_D,
         "E": _PROMPT_E,
@@ -664,8 +806,23 @@ def collect_data(state: ResearchFlowState, llm: ChatOpenAI) -> dict:
 
     logger.info(f"开始信息采集: direction={direction}, topic={topic}")
 
-    # 1. 构建搜索查询
-    queries = _build_queries(direction, topic, keywords)
+    # 1. 构建搜索查询（优先使用模板引导生成）
+    if direction in ("B1", "B2"):
+        # B1 使用行业定位模板引导搜索
+        template_map = {"B1": "B1-行业定位.md", "B2": "B2-市场量化.md"}
+        template_file = template_map.get(direction, "B1-行业定位.md")
+        template = _read_template(template_file)
+        template_queries = _generate_template_guided_searches(llm, direction, topic, template)
+        if template_queries:
+            # 合并：模板引导查询 + 基础查询（去重）
+            base_queries = _build_queries(direction, topic, keywords)
+            combined = list(dict.fromkeys(template_queries + base_queries))
+            queries = combined[:20]
+            logger.info(f"{direction}模板引导搜索: 使用{len(template_queries)}条模板查询 + {len(base_queries)}条基础查询")
+        else:
+            queries = _build_queries(direction, topic, keywords)
+    else:
+        queries = _build_queries(direction, topic, keywords)
 
     # 2. 执行搜索
     search_results = _run_multi_searches(queries)
@@ -740,6 +897,7 @@ _SCREENING_PROMPT = """你是调研数据筛选与决策器。请根据采集到
 ## 筛选标准（按方向）
 - A 技术方案：创新性30% + 可复现性35% + 难度适中25% + 时效性10%
 - B1 行业+市场：数据可靠性25% + 时效性25% + 规模增速20% + 竞争格局20% + PEST完整性10%
+- B2 市场量化：数据完整性30% + TAM/SAM/SOM测算25% + 细分市场规模25% + 时效性20%
 - C 学术综述：研究空白35% + 引用影响力25% + 时效性25% + 方法代表性15%
 - D 竞品分析：功能覆盖30% + 社区活跃度25% + 上手成本25% + 生态成熟度20%
 - E 政策趋势：政策力度30% + 落地进展35% + 覆盖范围20% + 时效性15%
@@ -809,6 +967,9 @@ _SOLUTION_DESIGN_PROMPT = """你是调研方案设计器。请根据筛选结果
 ### 模板B1（行业+市场型）
 行业定义与阶段 → PEST宏观环境（政治/经济/社会/技术，各一句话定性） → 波特五力竞争分析（每力一句话定性） → 市场规模（TAM/SAM/SOM，附测算方法和假设） → 历年市场规模表格（含增速） → STP市场细分（细分维度/目标选择/定位） → 渗透率与市场阶段 → 产业链拆解 → 竞争格局（梯队/份额/集中度，不做产品横向对比） → 关键玩家 → 驱动因素（技术/需求/资本） → 行业痛点与挑战（重点章节） → 风险与挑战 → 趋势判断
 注：政策原文和领导人讲话见政策趋势方向（E），竞品功能/参数对比见竞品分析方向（D）
+
+### 模板B2（市场量化型）
+TAM/SAM/SOM三层测算（附公式+假设+数据来源） → 历年市场规模数据表 → 细分市场量化（按用户/产品/地区拆分+各自规模） → 渗透率分析 → 竞争集中度（CR3/CR5/CR10） → 增长驱动因素量化 → 市场进入壁垒 → 风险量化
 
 ### 模板C（学术综述型）
 研究背景 → 主流方法演进 → 代表工作对比 → 研究空白 → 未来方向 → 我们的研究切入点

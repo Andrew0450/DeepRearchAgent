@@ -20,6 +20,7 @@ def _to_safe_filename(topic: str, direction: str = "") -> str:
     direction_map = {
         "A": "A_tech",
         "B1": "B1_industry",
+        "B2": "B2_market_quant",
         "C": "C_academic",
         "D": "D_competitor",
         "E": "E_policy",
@@ -38,6 +39,8 @@ def _to_safe_filename(topic: str, direction: str = "") -> str:
         "半导体": "semiconductor",
         "量子计算": "quantum_computing",
         "脑机接口": "brain_computer",
+        "AI芯片": "ai_chip",
+        "人工智能芯片": "ai_chip",
     }
 
     # 匹配已知主题

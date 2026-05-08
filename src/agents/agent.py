@@ -139,11 +139,13 @@ def build_agent(ctx=None):
 
             # 自动调用文档生成工具
             doc_url = ""
+            # 从 workflow result 中提取正确的 direction
+            actual_direction = (result.get("parsed") or {}).get("direction", "") or direction
             try:
                 doc_result = generate_report_document.invoke({
                     "report_content": full_report_content,
                     "topic": topic,
-                    "direction": direction,
+                    "direction": actual_direction,
                 })
                 doc_url = doc_result.strip()
                 logger.info(f"文档生成成功: {doc_url[:80]}...")
