@@ -1,16 +1,17 @@
 """
 ResearchFlow 调研引擎 Agent
-通用调研工作流引擎，支持4个方向（行业+市场/学术综述/竞品对比/政策分析）
+通用调研工作流引擎，支持5个方向（行业+市场/市场量化/学术综述/竞品对比/政策分析）
 输入主题关键词，输出讲稿 + PPT提示词 + 参考文献 + 可下载文档
 
 架构：
 - Agent 作为协调器，接收用户输入
 - run_research_flow 工具封装完整的 LangGraph 工作流
 - 工作流内部包含：主题解析 → 多维度搜索 → 筛选决策 → 方案设计 → 成果输出
-- 调研完成后自动生成 DOCX 文档，返回下载链接
+- 调研完成后自动生成 MD 文档，返回下载链接
 """
 
 import os
+import re
 import json
 import logging
 from typing import Annotated
@@ -28,7 +29,7 @@ from coze_coding_utils.runtime_ctx.context import default_headers
 from storage.memory.memory_saver import get_memory_saver
 from graphs.research_flow import build_research_flow, ResearchFlowState
 from tools.research_search_tool import research_search, deep_search
-from tools.report_document_tool import generate_report_document
+from tools.report_document_tool import generate_report_document, _to_safe_filename
 
 logger = logging.getLogger(__name__)
 
@@ -137,18 +138,36 @@ def build_agent(ctx=None):
             full_report_content = "\n".join(report_parts)
             error_msg = result.get("error", "")
 
-            # 自动调用文档生成工具
+            # 自动生成 MD 文档并上传对象存储
             doc_url = ""
-            # 从 workflow result 中提取正确的 direction
             actual_direction = (result.get("parsed") or {}).get("direction", "") or direction
             try:
-                doc_result = generate_report_document.invoke({
-                    "report_content": full_report_content,
-                    "topic": topic,
-                    "direction": actual_direction,
-                })
-                doc_url = doc_result.strip()
-                logger.info(f"文档生成成功: {doc_url[:80]}...")
+                from coze_coding_dev_sdk.s3 import S3SyncStorage
+
+                storage = S3SyncStorage(
+                    endpoint_url=os.getenv("COZE_BUCKET_ENDPOINT_URL"),
+                    bucket_name=os.getenv("COZE_BUCKET_NAME"),
+                )
+                # 生成文件名（使用 .md 后缀）
+                filename = _to_safe_filename(topic, actual_direction) + ".md"
+                # 清理报告内容：移除工具返回标记
+                cleaned = full_report_content.strip()
+                cleaned = re.sub(r"^#+\s*📋\s*ResearchFlow.*?\n+", "", cleaned, flags=re.IGNORECASE)
+                cleaned = re.sub(r"^---+\s*$", "", cleaned, flags=re.MULTILINE)
+                cleaned = re.sub(
+                    r"^#{1,3}\s*(?:第一|第二|第三|第四|第五|第六)\s*部分[：:].*?$",
+                    "",
+                    cleaned,
+                    flags=re.MULTILINE,
+                )
+                # 上传 MD 文件
+                file_key = storage.upload_file(
+                    file_content=cleaned.encode("utf-8"),
+                    file_name=filename,
+                    content_type="text/markdown; charset=utf-8",
+                )
+                doc_url = storage.generate_presigned_url(key=file_key, expire_time=86400)
+                logger.info(f"MD文档上传成功: {doc_url[:80]}...")
             except Exception as doc_err:
                 logger.warning(f"文档生成失败，跳过: {doc_err}")
                 doc_url = ""
@@ -167,7 +186,7 @@ def build_agent(ctx=None):
                 safe_name = topic.replace("/", "_").replace("\\", "_")
                 output_parts.append(
                     f"\n---\n\n📎 **完整报告文件（点击下载，链接有效期24小时）：**\n"
-                    f"[{safe_name}_调研报告.docx]({doc_url})"
+                    f"[{safe_name}_调研报告.md]({doc_url})"
                 )
 
             return "\n".join(output_parts)
@@ -181,15 +200,16 @@ def build_agent(ctx=None):
                           extra_requirements: str = "") -> str:
         """启动 ResearchFlow 调研工作流，执行从主题解析到成果输出的完整调研流程。
 
-        支持6个调研方向：
+        支持5个调研方向：
         - A: 技术方案（课设/毕设找可复现方案）
-        - B1: 行业驱动（了解行业全貌）
+        - B1: 行业+市场（了解行业全貌，含PEST/波特五力/产业链/竞争格局）
+        - B2: 市场量化（市场细分与规模，含TAM/SAM/SOM/渗透率/集中度）
         - C: 学术综述（写综述/找研究空白）
-        - D: 竞品分析（对比同类产品/方案）
-        - E: 政策趋势（政策分析/趋势研究）
+        - D: 竞品对比（对比同类产品/方案）
+        - E: 政策趋势（政策分析/趋势研究，含领导人讲话）
 
         当用户给出明确的调研主题后，调用此工具执行调研。
-        工具返回完整的调研报告（Markdown格式）、PPT提示词、参考文献，以及可下载的 DOCX 文件链接。
+        工具返回完整的调研报告（Markdown格式）、PPT提示词、参考文献，以及可下载的 MD 文件链接。
 
         Args:
             topic: 调研主题关键词，如"人形机器人产业"
