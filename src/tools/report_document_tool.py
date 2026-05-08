@@ -20,7 +20,6 @@ def _to_safe_filename(topic: str, direction: str = "") -> str:
     direction_map = {
         "A": "A_tech",
         "B1": "B1_industry",
-        "B2": "B2_product",
         "C": "C_academic",
         "D": "D_competitor",
         "E": "E_policy",
@@ -79,7 +78,7 @@ def generate_report_document(
         report_content: 调研报告的完整 Markdown 内容（从 run_research_flow 返回值中提取第一部分）
         topic: 调研主题，用于生成文件名（如"人形机器人产业"）
         doc_format: 文档格式，默认为 "docx"（也支持 "pdf"）
-        direction: 调研方向代码（A/B1/B2/C/D/E），用于生成规范的文件名
+        direction: 调研方向代码（A/B1/C/D/E），用于生成规范的文件名
 
     返回:
         文件下载链接（24小时内有效），返回格式：'📎 文档已生成：[格式]下载 | 报告标题 | 下载链接'

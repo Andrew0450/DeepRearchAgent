@@ -1,6 +1,6 @@
 """
 ResearchFlow 调研引擎 Agent
-通用调研工作流引擎，支持6个方向（技术方案/行业驱动/产品驱动/学术综述/竞品分析/政策趋势）
+通用调研工作流引擎，支持4个方向（行业+市场/学术综述/竞品对比/政策分析）
 输入主题关键词，输出讲稿 + PPT提示词 + 参考文献 + 可下载文档
 
 架构：
@@ -65,7 +65,6 @@ def _report_type_for_direction(direction: str) -> str:
     mapping = {
         "A": "技术方案报告",
         "B1": "行业调研报告",
-        "B2": "产品调研报告",
         "C": "学术综述报告",
         "D": "竞品分析报告",
         "E": "政策分析报告",
@@ -183,7 +182,6 @@ def build_agent(ctx=None):
         支持6个调研方向：
         - A: 技术方案（课设/毕设找可复现方案）
         - B1: 行业驱动（了解行业全貌）
-        - B2: 产品驱动（了解产品背后行业）
         - C: 学术综述（写综述/找研究空白）
         - D: 竞品分析（对比同类产品/方案）
         - E: 政策趋势（政策分析/趋势研究）
@@ -193,8 +191,8 @@ def build_agent(ctx=None):
 
         Args:
             topic: 调研主题关键词，如"人形机器人产业"
-            direction: 调研方向代码（A/B1/B2/C/D/E），留空自动判断
-            template: 讲稿模板代码（A1/A2/B1/B2/C/D/E），留空使用默认
+            direction: 调研方向代码（A/B1/C/D/E），留空自动判断
+            template: 讲稿模板代码（A1/A2/B1/C/D/E），留空使用默认
             extra_requirements: 额外要求，如"重点分析上游供应链"
         """
         return _invoke_research_flow(topic, direction, template, extra_requirements)

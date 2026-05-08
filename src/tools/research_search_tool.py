@@ -69,7 +69,7 @@ def research_search(query: str, direction: str = "综合", time_range: str = "")
 
     Args:
         query: 搜索关键词，尽量具体明确
-        direction: 调研方向，可选值: 技术方案(A)/行业驱动(B1)/产品驱动(B2)/学术综述(C)/竞品分析(D)/政策趋势(E)/综合，默认"综合"
+        direction: 调研方向，可选值: 技术方案(A)/行业+市场(B1)/学术综述(C)/竞品对比(D)/政策分析(E)/综合，默认"综合"
         time_range: 时间范围过滤，可选: 1d(近1天)/1w(近1周)/1m(近1月)/1y(近1年)，留空不过滤
     """
     # 根据方向调整搜索策略
