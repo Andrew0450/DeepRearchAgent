@@ -3,7 +3,7 @@
         "model": "doubao-seed-2-0-pro-260215",
         "temperature": 0.7,
         "top_p": 0.9,
-        "max_completion_tokens": 10000,
+        "max_completion_tokens": 30000,
         "timeout": 600,
         "thinking": "enabled"
     },
