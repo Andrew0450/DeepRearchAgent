@@ -1,0 +1,1179 @@
+"""
+ResearchFlow 调研工作流 (LangGraph)
+6 方向通用调研引擎，输入主题 → 输出讲稿 + PPT提示词 + 参考文献
+
+工作流节点:
+1. topic_parser    - 主题解析，确定方向/关键词/范围
+2. collect_data    - 按方向执行多维度搜索 + LLM提取
+3. screening       - 数据筛选与质量评估
+4. solution_design - 按模板设计讲稿框架
+5. output_generation - 生成完整报告 + PPT提示词 + 参考文献
+"""
+
+import json
+import logging
+import os
+from typing import TypedDict, Optional, Annotated, List
+from functools import partial
+
+from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+
+from coze_coding_dev_sdk import SearchClient
+from coze_coding_utils.log.write_log import request_context
+from coze_coding_utils.runtime_ctx.context import new_context
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# 模板文件路径
+# ============================================================================
+_WORKSPACE = os.getenv("COZE_WORKSPACE_PATH", "/workspace/projects")
+_TEMPLATE_DIR = os.path.join(_WORKSPACE, "assets")
+
+
+def _read_template(template_name: str) -> str:
+    """读取模板文件内容，用于引导搜索和提取"""
+    path = os.path.join(_TEMPLATE_DIR, template_name)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        logger.info(f"读取模板文件: {path}, 长度={len(content)}")
+        return content
+    except FileNotFoundError:
+        logger.warning(f"模板文件不存在: {path}")
+        return ""
+    except Exception as e:
+        logger.error(f"读取模板文件失败: {path}, error={e}")
+        return ""
+
+
+def _generate_template_guided_searches(
+    llm, direction: str, topic: str, template_content: str
+) -> List[str]:
+    """基于模板内容生成针对性的搜索查询列表"""
+    if not template_content:
+        return []
+
+    # 截取模板前4000字符（避免超长上下文）
+    template_snippet = template_content[:4000]
+
+    prompt = f"""你是一个专业的研究助手，负责为调研任务生成针对性的搜索查询。
+
+## 调研任务
+- 方向: {direction}
+- 主题: {topic}
+
+## 模板框架（定义了需要收集的数据字段）
+请仔细阅读以下模板，它定义了需要收集的具体数据字段。你需要为每个章节/字段生成1-3条搜索查询：
+
+---
+{template_snippet}
+---
+
+## 任务要求
+1. 根据模板的章节和字段定义，为"主题：{topic}"生成精准的搜索查询
+2. 每条查询要具体（包含产品/公司名或关键指标），不要泛泛而问
+3. 特别关注模板中的"厂商列表"、"出货量"、"市场规模"、"产业链"等数据字段
+4. 生成8-15条搜索查询，覆盖模板的主要章节
+5. 每条查询单独一行，不要加序号，不要解释
+
+直接输出查询列表，每行一条：
+"""
+
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        text = response.content if isinstance(response.content, str) else str(response.content)
+        # 解析：每行一个查询，去除空行和序号
+        queries = []
+        for line in text.strip().split("\n"):
+            line = line.strip().strip("0123456789.、、- ")
+            if line and len(line) > 5:
+                queries.append(line)
+        logger.info(f"模板引导生成搜索查询 {len(queries)} 条")
+        return queries[:15]
+    except Exception as e:
+        logger.error(f"生成模板引导搜索失败: {e}")
+        return []
+
+# ============================================================================
+# State
+# ============================================================================
+
+class ResearchFlowState(TypedDict):
+    # 输入
+    topic: str
+    direction: str
+    template: str
+    extra_requirements: str
+
+    # Node 1 输出
+    parsed: Optional[dict]
+
+    # 多任务检测
+    multi_topic: Optional[List[str]]  # 检测到多个任务时，填入任务列表
+
+    # Node 2 输出
+    collected_data: Optional[str]
+
+    # Node 3 输出
+    screening_result: Optional[str]
+
+    # Node 4 输出
+    solution_framework: Optional[str]
+
+    # Node 5 输出
+    report: Optional[str]
+    ppt_prompt: Optional[str]
+    references: Optional[str]
+
+    # 错误信息
+    error: Optional[str]
+
+
+# ============================================================================
+# 搜索辅助函数
+# ============================================================================
+
+def _execute_search(query: str, count: int = 8, time_range: str = None,
+                    sites: str = None, need_content: bool = False) -> str:
+    """执行单次搜索，返回格式化结果"""
+    ctx = request_context.get() or new_context(method="research_flow.search")
+    client = SearchClient(ctx=ctx)
+
+    try:
+        response = client.search(
+            query=query,
+            search_type="web",
+            count=count,
+            need_content=need_content,
+            need_url=True,
+            need_summary=True,
+            sites=sites,
+            time_range=time_range,
+        )
+
+        parts = []
+        if response.summary:
+            parts.append(f"【AI摘要】{response.summary}\n")
+
+        if response.web_items:
+            for i, item in enumerate(response.web_items, 1):
+                parts.append(
+                    f"[{i}] {item.title or '无标题'}\n"
+                    f"    来源: {item.site_name or '未知'} | URL: {item.url or ''}\n"
+                    f"    摘要: {item.snippet or ''}\n"
+                )
+
+        return "\n".join(parts) if parts else f"搜索 '{query}' 未找到结果。"
+
+    except Exception as e:
+        logger.error(f"搜索失败: query={query}, error={e}")
+        return f"搜索 '{query}' 执行失败: {str(e)}"
+
+
+def _run_multi_searches(queries: List[str], sites: str = None, time_range: str = None) -> str:
+    """执行多轮搜索，合并结果"""
+    results = []
+    for i, query in enumerate(queries, 1):
+        logger.info(f"搜索 [{i}/{len(queries)}]: {query}")
+        result = _execute_search(query, count=8, sites=sites, time_range=time_range)
+        results.append(f"=== 搜索 {i}: {query} ===\n{result}\n")
+    return "\n".join(results)
+
+
+# ============================================================================
+# Node 1: 主题解析
+# ============================================================================
+
+_TOPIC_PARSER_PROMPT = """你是调研主题解析器。请分析用户给出的调研主题，检测是否包含多个独立任务，并输出结构化信息。
+
+## 输入
+- 主题：{topic}
+- 用户指定方向：{direction}
+- 用户额外要求：{extra_requirements}
+
+## 任务
+1. 【多任务检测】检查主题是否包含多个独立调研任务
+   - 触发条件：包含"和""与""+""、"、"或"等连接词，或用顿号、换行符分隔
+   - 示例1："人形机器人产业和低空经济" → 两个任务
+   - 示例2："竞品分析+政策研究" → 两个任务
+   - 示例3："技术方案调研" → 一个任务
+2. 将每个任务转化为明确的调研问题
+3. 如果用户没有指定方向，判断最合适的方向（每个任务可以不同）
+4. 生成搜索用的关键词列表
+
+## 方向判断规则
+- 包含"技术""方案""设计""实现""仿真""复现" → A
+- 是一个行业名称（如"人形机器人""低空经济"） → B1
+- 是一个具体产品 → B1（行业+市场，包含产品市场规模）
+- 包含"综述""研究进展""研究空白""方法论" → C
+- 包含"对比""竞品""选型""评测""替代" → D
+- 包含"政策""趋势""监管""合规""规划" → E
+
+## 输出格式（严格JSON，不要输出其他内容）
+
+// 如果检测到多个任务：
+{{
+  "is_multi_topic": true,
+  "topics": [
+    {{
+      "topic": "任务1具体主题",
+      "direction": "B1",
+      "direction_reason": "判断理由",
+      "template": "B1",
+      "search_keywords": {{
+        "primary": ["核心关键词1"],
+        "secondary": ["补充关键词1"],
+        "english": ["English keyword 1"]
+      }},
+      "scope": {{
+        "time_range": "近3年",
+        "depth": "standard",
+        "focus_areas": ["重点关注领域"]
+      }}
+    }},
+    {{
+      "topic": "任务2具体主题",
+      "direction": "E",
+      "direction_reason": "判断理由",
+      "template": "E",
+      "search_keywords": {{
+        "primary": ["核心关键词2"],
+        "secondary": ["补充关键词2"],
+        "english": []
+      }},
+      "scope": {{
+        "time_range": "近3年",
+        "depth": "standard",
+        "focus_areas": ["重点关注领域"]
+      }}
+    }}
+  ]
+}}
+
+// 如果只有一个任务：
+{{
+  "is_multi_topic": false,
+  "questions": ["调研问题1", "调研问题2"],
+  "direction": "B1",
+  "direction_reason": "判断理由",
+  "template": "B1",
+  "search_keywords": {{
+    "primary": ["核心关键词1", "核心关键词2"],
+    "secondary": ["补充关键词1", "补充关键词2"],
+    "english": ["English keyword 1", "English keyword 2"]
+  }},
+  "scope": {{
+    "time_range": "近3年",
+    "depth": "standard",
+    "focus_areas": ["重点关注领域1", "重点关注领域2"]
+  }}
+}}"""
+
+
+def topic_parser(state: ResearchFlowState, llm: ChatOpenAI) -> dict:
+    """解析主题，输出结构化信息（支持多任务检测）"""
+    topic = state["topic"]
+    direction = state.get("direction", "")
+    extra = state.get("extra_requirements", "")
+
+    prompt = _TOPIC_PARSER_PROMPT.format(
+        topic=topic,
+        direction=direction or "未指定",
+        extra_requirements=extra or "无",
+    )
+
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        content = response.content if isinstance(response.content, str) else str(response.content)
+
+        # 提取 JSON
+        json_str = content
+        if "```json" in content:
+            json_str = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            json_str = content.split("```")[1].split("```")[0].strip()
+
+        parsed = json.loads(json_str)
+
+        # 如果用户指定了方向，强制使用用户指定值
+        if direction and direction.strip():
+            parsed["direction"] = direction.strip()
+
+        # 检测多任务
+        is_multi = parsed.get("is_multi_topic", False)
+        if is_multi:
+            topics_list = parsed.get("topics", [])
+            topic_names = [t.get("topic", "") for t in topics_list]
+            logger.info(f"检测到多任务: {topic_names}")
+            return {
+                "parsed": parsed,
+                "multi_topic": topic_names,
+            }
+
+        logger.info(f"主题解析完成: direction={parsed.get('direction')}, "
+                    f"questions={parsed.get('questions')}")
+        return {"parsed": parsed, "multi_topic": None}
+
+    except Exception as e:
+        logger.error(f"主题解析失败: {e}")
+        # 降级处理
+        fallback_dir = direction.strip() if direction and direction.strip() else "B1"
+        return {
+            "parsed": {
+                "questions": [topic],
+                "direction": fallback_dir,
+                "direction_reason": "解析失败，使用默认方向",
+                "template": fallback_dir,
+                "search_keywords": {
+                    "primary": [topic],
+                    "secondary": [],
+                    "english": [],
+                },
+                "scope": {
+                    "time_range": "近3年",
+                    "depth": "standard",
+                    "focus_areas": [],
+                },
+            },
+            "multi_topic": None,
+            "error": f"主题解析异常，已降级处理: {str(e)}",
+        }
+
+
+# ============================================================================
+# Node 2: 信息采集 (按方向分发)
+# ============================================================================
+
+# ---- 方向 A: 技术方案 ----
+_PROMPT_A = """你是学术论文筛选器。请根据搜索结果，筛选出最相关的论文与方案。
+
+## 调研问题
+{questions}
+
+## 搜索结果
+{search_results}
+
+## 筛选标准
+| 维度 | 权重 |
+|------|------|
+| 创新性 | 30% |
+| 可复现性 | 35% |
+| 难度适中性 | 25% |
+| 时效性 | 10% |
+
+## 输出要求
+1. 按相关度排序，选出Top 10论文/方案
+2. 每篇输出：标题、作者、年份、核心方法、创新点、可复现性评估、难度评估、来源URL
+3. 最终推荐Top 3，附推荐理由
+4. 绝不编造论文，搜索结果中没有的不要写
+5. 所有数据标注来源 [来源名称](URL)"""
+
+_SEARCH_QUERIES_A = [
+    '{primary} 方案 对比 综述',
+    '{primary} 开源实现 GitHub',
+    '{english} survey review',
+]
+
+# ---- 方向 B1: 行业+市场 ----
+_PROMPT_B1 = """你是行业+市场分析数据提取器。按"宏观行业→中观市场→竞争格局"三层结构提取数据。
+
+## 调研主题
+{topic}
+
+## 调研问题
+{questions}
+
+## 搜索结果
+{search_results}
+
+## 需要提取的数据（严格按以下框架，不遗漏任何章节）
+
+### 一、宏观行业分析（回答：赛道值不值得进？）
+
+1. **行业定义与阶段**
+   - 行业边界：涵盖哪些细分赛道？
+   - 发展阶段：导入期/成长期/成熟期/衰退期？（以渗透率数据为判断依据）
+   - 核心价值：该行业解决什么根本问题？对社会/经济的意义？
+
+2. **PEST宏观环境分析**
+   - Political（政策）：支持政策 vs 限制政策，各有哪些？
+   - Economic（经济）：宏观经济对该行业的影响（消费能力、资本投入意愿）？
+   - Social（社会）：人口结构/消费观念/劳动力替代等社会因素？
+   - Technological（技术）：核心技术突破？技术路线演进？国内外技术差距？
+   注：详细政策原文和领导人讲话见政策趋势方向（E），本节不展开
+
+3. **波特五力竞争分析**
+   - 现有竞争者：竞争激烈程度？头部集中度？
+   - 新进入者威胁：进入门槛高低？有哪些壁垒？
+   - 替代品威胁：是否存在替代方案？替代品优劣势？
+   - 上游议价能力：核心零部件供应商的议价能力？
+   - 下游议价能力：客户/渠道的议价能力？
+
+4. **产业链结构**
+   - 上游：核心零部件/原材料，代表企业，核心壁垒
+   - 中游：整机制造/方案集成，代表企业，价值分配
+   - 下游：应用场景/终端用户，代表企业，服务模式
+   - 各环节价值占比（微笑曲线分析）
+
+### 二、中观市场分析（回答：蛋糕有多大？怎么切？）
+
+5. **市场规模与增速**
+   - **TAM（总潜在市场）**：理论市场规模，假设100%渗透
+   - **SAM（可服务市场）**：实际可触达的市场，考虑地理/渠道限制
+   - **SOM（可获得市场）**：短期（1-3年）可拿到的份额
+   - 测算方法说明：三种方法（自上而下/自下而上/类比法），优先用自下而上法，三种方法相互验证
+   - **历年市场规模数据表格**：| 年份 | 全球 | 中国 | 增速 | 来源 |
+   - 市场增速：当前增速、未来CAGR预测
+
+6. **STP市场细分**
+   - Segmentation（细分）：按什么维度拆分市场？（用户类型/场景/地区/价格带）
+   - Targeting（目标选择）：哪个细分市场最值得切入？吸引力评估（规模/增速/利润率/竞争强度）
+   - Positioning（定位）：目标用户的核心需求是什么？与竞品的差异化定位？
+
+7. **渗透率与市场阶段**
+   - 当前渗透率（目标用户中实际使用者的比例）
+   - 渗透率判断所处阶段：导入期(<5%)/成长期(5%-20%)/加速期(20%-50%)/成熟期(>50%)
+
+### 三、竞争格局
+
+8. **竞争格局总览**
+   - 梯队划分（第一/第二/其他梯队），附代表性企业名单
+   - 市场份额分布（定量数据：各梯队/主要玩家的市场占比）
+   - 市场集中度（CR3/CR5等指标）
+   - 注：具体产品的功能/参数/价格横向对比见竞品分析方向（D），此章节不做产品横向对比
+
+9. **关键玩家分析**
+   - 每个梯队2-3家代表性企业
+   - 核心优势、主要产品、市场定位
+
+### 四、行业健康度
+
+10. **驱动因素**（技术/需求/资本，推动行业增长的核心动力）
+11. **行业痛点与挑战**（技术瓶颈/成本压力/人才短缺/监管限制，具体案例支撑）
+12. **风险与挑战**（宏观/政策/技术替代/同质化竞争风险）
+13. **趋势判断**（未来3-5年发展方向）
+
+## 输出要求
+- **年份数据必须整理成表格**：| 年份 | 全球市场规模 | 中国市场规模 | 增长率 | 来源 |
+- **PEST和波特五力各用一段文字描述**，每个力一句话定性（强/中/弱）
+- **TAM/SAM/SOM单独成节**，说明估算方法和假设
+- 每条数据标注来源 [来源名称](URL)
+- 没有的写"未给出"，绝不允许编造
+- 超过2年数据标注年份
+- 估算值写明公式+参数来源+假设，标注 ⚠️估算值
+- 痛点部分必须具体，每条附案例或数据支撑
+- 优先级：官方统计 > 权威研报 > 行业媒体 > 社区讨论"""
+
+_SEARCH_QUERIES_B1 = [
+    '{primary} PEST 宏观环境 政策 经济 社会 技术',
+    '{primary} 波特五力 竞争 替代 进入壁垒 议价',
+    '{primary} 市场规模 TAM SAM SOM 渗透率 细分',
+    '{primary} 行业分析 产业链 头部企业 市场份额 集中度',
+    '{primary} 行业痛点 挑战 困难 瓶颈',
+    '{english} market size TAM SAM SOM penetration rate segmentation',
+]
+
+# ---- B2 方向: 市场量化（行业+市场组合的量化部分）----
+# B2 = 市场量化，回答"蛋糕有多大"，专注TAM/SAM/SOM + 历年数据 + 竞争格局数据
+_SEARCH_QUERIES_B2 = [
+    '{primary} 市场规模 全球 中国 TAM SAM SOM 渗透率',
+    '{primary} {primary} 出货量 销量 增长率 年度数据',
+    '{primary} {primary} 竞争格局 市场份额 集中度 头部玩家',
+    '{primary} 细分市场 按产品 按地区 按用户类型',
+    '{primary} 用户画像 需求特征 消费行为 付费意愿',
+    '{primary} 市场预测 CAGR 增长趋势 未来空间',
+    '{english} {english} market size TAM SAM SOM shipment revenue growth rate',
+    '{english} {english} market share concentration leading players competitive landscape',
+]
+
+_PROMPT_B2 = """你是一个专业的市场分析师。请根据搜索结果，为「{topic}」进行市场量化分析。
+
+## 调研主题
+{topic}
+
+## 搜索结果
+{search_results}
+
+## 核心任务
+请从搜索结果中提取以下市场量化数据，填充到对应框架中：
+
+### 一、产品定义与市场边界
+- 产品的明确定义（功能/形态/核心参数）
+- 主要产品形态分类（按价格/场景/技术路线）
+- 目标用户群体画像（年龄/收入/使用场景）
+
+### 二、市场规模（TAM/SAM/SOM）
+请分别用三种方法估算（如果有数据的话）：
+1. **自上而下法**：TAM = 目标用户基数 × 平均客单价 × 年均消费频次
+2. **自下而上法**：SAM = Σ 各细分市场规模（按地区/用户类型拆分）
+3. **类比法**：参考 XX 市场 × 调整系数 = YY 市场
+
+注：不要只给一个数字，要说明估算方法和假设条件
+
+### 三、历年市场规模数据
+请尽可能填写以下年份的市场规模数据（单位：亿元/万美元）：
+| 年份 | 全球市场规模 | 中国市场规模 | 同比增长率 |
+|------|------------|------------|----------|
+| 2020 |            |            |          |
+| 2021 |            |            |          |
+| 2022 |            |            |          |
+| 2023 |            |            |          |
+| 2024 |            |            |          |
+| 2025 |            |            |          |
+| 2026E |          |            |          |
+
+注：数据来源必须标注；若某年数据缺失，写"未给出"并说明可能原因
+
+### 四、竞争格局数据
+- 全球市场：主要玩家名称 + 各自的市场份额
+- 中国市场：主要玩家名称 + 各自的市场份额
+- 市场集中度（CR3/CR5/CR10）
+- 新进入者威胁程度
+
+### 五、用户画像
+- 主力用户群体特征（年龄段/收入水平/使用场景）
+- 核心需求（功能需求/体验需求/情感需求）
+- 付费意愿区间
+
+### 六、关键数据缺口
+列出当前数据中的空白点，标注"数据缺失（建议通过XX渠道补充）"
+
+## 数据质量要求
+- 每条数据必须附来源，格式：[来源名称](URL)
+- 估算值必须标注"⚠️估算值"，并说明计算公式
+- 未给出的数据写"未给出"，不要编造
+- 数据差异过大时，优先采信权威机构数据
+"""
+
+# ---- 方向 C: 学术综述 ----
+_PROMPT_C = """你是学术论文结构化分析器。请梳理研究脉络。
+
+## 调研主题
+{topic}
+
+## 搜索结果
+{search_results}
+
+## 输出要求
+1. 研究背景：问题定义与研究意义
+2. 方法演进：按时间线梳理主流方法
+3. 代表工作对比：核心论文（标题/年份/方法/创新/引用/URL）
+4. 研究空白：未解决的问题
+5. 未来方向：技术趋势和突破口
+
+注意：绝不编造论文，搜索结果中没有的不要写。"""
+
+_SEARCH_QUERIES_C = [
+    '{primary} 综述 survey review',
+    '{primary} 研究进展 最新',
+    '{english} survey review state-of-the-art',
+]
+
+# ---- 方向 D: 竞品分析 ----
+_PROMPT_D = """你是竞品数据提取器。请提取竞品信息。
+
+## 调研主题
+{topic}
+
+## 搜索结果
+{search_results}
+
+## 分层搜索策略
+第一层：头部产品（通用搜索+电商畅销榜）
+第二层：细分领域（开源/众筹/垂直平台）
+第三层：冷门/长尾（多语言/技术反查）
+
+## 【禁止】本方向不做以下内容
+- ❌ 不写市场规模、增长率、市场预测
+- ❌ 不写产业链分析
+- ❌ 不写政策分析
+- ❌ 不写行业痛点
+
+## 输出要求
+对每个竞品提取：产品名、厂商、核心功能、关键参数、定价、来源URL
+注意：绝不编造价格和参数，没有的写"未给出"。"""
+
+_SEARCH_QUERIES_D = [
+    '{primary} 竞品对比 review comparison',
+    '{primary} 开源 GitHub 替代方案',
+    '{english} alternatives competitors comparison',
+]
+
+# ---- 方向 E: 政策趋势 ----
+_PROMPT_E = """你是政策数据提取器。请提取政策与趋势信息。
+
+## 调研主题
+{topic}
+
+## 搜索结果
+{search_results}
+
+## 需要提取的数据
+1. 政策背景与宏观环境
+2. 核心政策文件（名称/机构/时间/要点/URL）
+3. 高层讲话与名人名言（必须重点提取！）
+   - **国家领导人讲话**：习近平/李强等关于本主题的重要讲话，提取：人名、场合（会议名称/地点）、时间（年月日）、核心原话或要点概括、来源URL
+   - **领域名人言论**：吴恩达、李飞飞、周志华、周鸿祎等行业领袖/专家的相关言论，提取：人名、场合、时间、核心表述、来源URL
+   - 如果未找到领导人讲话，搜索"习近平 + 主题"、"李强 + 主题"、"部长 + 主题"补充
+4. 受益/受限环节（政策对哪些细分赛道/企业类型有支持或限制，一句话概括即可）
+5. 落地进展：试点/示范（一句话）
+6. 国际对比：其他国家政策（一句话，不做展开）
+
+## 【禁止】本方向不做以下内容
+- ❌ 不写市场规模数据（那是行业+市场方向B1的工作）
+- ❌ 不写产业链分析
+- ❌ 不写竞品对比
+- ❌ 不做市场预测
+
+## 输出要求
+- 政策找原文，附来源URL
+- 标注发布时间和生效时间
+- 关注"试点""示范"类政策
+- **领导人讲话必须附时间和场合**，如"2024年3月，习近平在XX会议上指出：..."
+- **名人名言必须标注出处和场合**
+- 绝不编造政策内容或讲话内容
+- 篇幅重点：政策原文引用 > 领导人讲话 > 国际对比"""
+
+_SEARCH_QUERIES_E = [
+    '{primary} 政策 规划 管理办法',
+    '{primary} 试点 示范 落地进展',
+    '{english} policy regulation framework',
+    '习近平 {primary} 重要讲话',
+    '{primary} 吴恩达 OR 李飞飞 OR 专家 观点',
+    '{primary} 官方 发布会 吹风会',
+]
+
+
+# ============================================================================
+# 全局结构化提取 Prompt（所有方向通用）
+# 强制从采集文本中提取：市场数据、竞品、政策、技术、学术等所有方向的关键数据
+# ============================================================================
+
+_EXTRACT_GLOBAL = """你是结构化数据提取器。请从以下采集文本中，提取所有能找到的结构化数据。
+
+## 重要原则
+- **宁可多提取，不可漏提**：如果搜索结果中出现了具体数字、表格、排名、政策名称、产品参数，务必提取
+- **严格基于文本**：只提取文本中实际存在的数据，不编造、不推测
+- **未找到标注"未找到"**：某个字段在文本中完全没有提及时，写"未找到"
+- **保留来源**：每个数据项必须附上来源 URL
+- **领导人/名人讲话必须提取**：若文本中出现习近平、李强等领导人，或吴恩达、李飞飞、周志华等行业名人对主题的相关言论，务必提取（人名、场合、时间、核心表述、来源URL）
+
+## 要提取的字段（全部方向适用，按实际内容提取，不全有）
+
+```json
+{{
+  "market_data": {{
+    "yearly_data": [
+      {{
+        "year": "年份",
+        "global_size": "全球市场规模（含单位）",
+        "china_size": "中国市场规模（含单位）",
+        "global_shipment": "全球出货量（含单位）",
+        "china_shipment": "中国出货量（含单位）",
+        "growth_rate": "同比增长率",
+        "source": "[来源名称](URL)"
+      }}
+    ]
+  }},
+  "competitive_products": [
+    {{
+      "name": "产品/竞品名称",
+      "price": "价格（含单位）",
+      "key_specs": "关键参数（可多行）",
+      "advantages": "主要优势",
+      "disadvantages": "主要劣势",
+      "rating": "综合评级",
+      "target_users": "目标用户",
+      "source": "[来源名称](URL)"
+    }}
+  ],
+  "pain_points": [
+    {{
+      "type": "痛点类型（技术/成本/政策/用户适配/市场竞争等）",
+      "problem": "具体问题描述",
+      "evidence": "证据（具体数据或用户反馈）",
+      "severity": "严重程度（高/中/低）",
+      "current_solution": "现有解决方案及效果",
+      "unresolved_reason": "未解决的根本原因",
+      "source": "[来源名称](URL)"
+    }}
+  ],
+  "policies": [
+    {{
+      "name": "政策名称",
+      "issued_by": "发布机构",
+      "date": "发布时间",
+      "key_content": "核心内容",
+      "impact": "对行业的影响",
+      "source": "[来源名称](URL)"
+    }}
+  ],
+  "leadership_statements": [
+    {{
+      "speaker": "讲话人姓名（如习近平、李强，或领域名人如吴恩达）",
+      "title": "职务/身份",
+      "occasion": "场合（如'全国两会'、'XX论坛'、'XX考察'）",
+      "date": "时间（YYYY-MM-DD）",
+      "quote": "核心原话或要点概括",
+      "source": "[来源名称](URL)"
+    }}
+  ],
+  "technical_specs": [
+    {{
+      "category": "技术类别（硬件/算法/材料等）",
+      "spec": "具体技术指标或方案",
+      "advantage": "优势",
+      "limitation": "局限性",
+      "maturity": "成熟度（实验/小规模/成熟）",
+      "source": "[来源名称](URL)"
+    }}
+  ],
+  "academic_papers": [
+    {{
+      "title": "论文标题",
+      "authors": "作者",
+      "year": "年份",
+      "journal": "期刊/会议",
+      "core_method": "核心方法",
+      "innovation": "创新点",
+      "reproducibility": "可复现性评估",
+      "url": "URL"
+    }}
+  ],
+  "upstream_components": ["核心上游供应商/技术1", "核心上游供应商/技术2"],
+  "downstream_applications": ["下游应用场景1", "下游应用场景2"],
+  "industry_overview": "一句话行业概述",
+  "notable_findings": ["其他值得关注的发现1", "其他值得关注的发现2"]
+}}
+```
+
+## 待分析文本
+{raw_text}
+"""
+
+
+def _build_queries(direction: str, topic: str, keywords: dict) -> List[str]:
+    """根据方向构建搜索查询列表"""
+    primary = ", ".join(keywords.get("primary", [topic]))
+    english = ", ".join(keywords.get("english", [topic]))
+
+    template_map = {
+        "A": _SEARCH_QUERIES_A,
+        "B1": _SEARCH_QUERIES_B1,
+        "B2": _SEARCH_QUERIES_B2,
+        "C": _SEARCH_QUERIES_C,
+        "D": _SEARCH_QUERIES_D,
+        "E": _SEARCH_QUERIES_E,
+    }
+
+    templates = template_map.get(direction, _SEARCH_QUERIES_B1)
+    queries = []
+    for tpl in templates:
+        q = tpl.format(primary=primary, english=english, topic=topic)
+        queries.append(q)
+    return queries
+
+
+def _build_collection_prompt(direction: str, topic: str, questions: List[str],
+                             search_results: str) -> str:
+    """根据方向构建采集节点Prompt"""
+    prompt_map = {
+        "A": _PROMPT_A,
+        "B1": _PROMPT_B1,
+        "B2": _PROMPT_B2,
+        "C": _PROMPT_C,
+        "D": _PROMPT_D,
+        "E": _PROMPT_E,
+    }
+    template = prompt_map.get(direction, _PROMPT_B1)
+    return template.format(
+        topic=topic,
+        questions="\n".join(f"- {q}" for q in questions),
+        search_results=search_results,
+    )
+
+
+def collect_data(state: ResearchFlowState, llm: ChatOpenAI) -> dict:
+    """按方向执行多维度搜索 + LLM 提取"""
+    parsed = state["parsed"]
+    direction = parsed.get("direction", "B1")
+    topic = state["topic"]
+    keywords = parsed.get("search_keywords", {"primary": [topic]})
+    questions = parsed.get("questions", [topic])
+
+    logger.info(f"开始信息采集: direction={direction}, topic={topic}")
+
+    # 1. 构建搜索查询（优先使用模板引导生成）
+    if direction in ("B1", "B2"):
+        # B1 使用行业定位模板引导搜索
+        template_map = {"B1": "B1-行业定位.md", "B2": "B2-市场量化.md"}
+        template_file = template_map.get(direction, "B1-行业定位.md")
+        template = _read_template(template_file)
+        template_queries = _generate_template_guided_searches(llm, direction, topic, template)
+        if template_queries:
+            # 合并：模板引导查询 + 基础查询（去重）
+            base_queries = _build_queries(direction, topic, keywords)
+            combined = list(dict.fromkeys(template_queries + base_queries))
+            queries = combined[:20]
+            logger.info(f"{direction}模板引导搜索: 使用{len(template_queries)}条模板查询 + {len(base_queries)}条基础查询")
+        else:
+            queries = _build_queries(direction, topic, keywords)
+    else:
+        queries = _build_queries(direction, topic, keywords)
+
+    # 2. 执行搜索
+    search_results = _run_multi_searches(queries)
+
+    # 3. LLM 提取结构化数据
+    prompt = _build_collection_prompt(direction, topic, questions, search_results)
+
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        content = response.content if isinstance(response.content, str) else str(response.content)
+        logger.info(f"信息采集完成: direction={direction}, content_length={len(content)}")
+
+        # ---- 步骤3.5: 强制结构化提取（B1/B2 专用）----
+        # 确保关键数据（竞品表格、年份数据）被明确提取，不被最终输出阶段遗漏
+        if direction in ("B1", "B2") and len(content) > 200:
+            structured = _do_structured_extraction(llm, direction, content, search_results)
+            if structured:
+                content = content + "\n\n## 【结构化提取数据 - 关键字段】\n" + structured
+                logger.info(f"结构化提取完成: structured_length={len(structured)}")
+
+        return {"collected_data": content}
+    except Exception as e:
+        logger.error(f"信息采集LLM处理失败: {e}")
+        return {
+            "collected_data": f"数据采集完成，但结构化处理失败。原始搜索结果:\n{search_results}",
+            "error": f"信息采集处理异常: {str(e)}",
+        }
+
+
+def _do_structured_extraction(llm: ChatOpenAI, direction: str,
+                               prose_data: str, raw_search: str) -> str:
+    """强制从采集数据中提取关键结构化字段（全局通用，所有方向适用）
+
+    提取：市场数据、竞品、政策、技术、学术、痛点等所有方向的关键数据。
+    """
+    # 优先用 prose_data（已有LLM提取），raw_search兜底
+    raw_text = prose_data if len(prose_data) > 200 else raw_search
+    raw_text = raw_text[:8000]  # 控制token
+
+    prompt = _EXTRACT_GLOBAL.format(raw_text=raw_text)
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        raw = response.content if isinstance(response.content, str) else str(response.content)
+        # 去掉markdown代码块包装
+        raw = raw.strip()
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            raw = "\n".join(lines[1:]) if len(lines) > 2 else raw
+            raw = raw.replace("```json", "").replace("```", "").strip()
+        logger.info("结构化提取完成（全局通用）")
+        return raw
+    except Exception as e:
+        logger.warning(f"结构化提取失败（不影响主流程）: {e}")
+        return ""
+
+
+# ============================================================================
+# Node 3: 筛选决策
+# ============================================================================
+
+_SCREENING_PROMPT = """你是调研数据筛选与决策器。请根据采集到的信息，按筛选标准评估。
+
+## 调研方向
+{direction}
+
+## 调研问题
+{questions}
+
+## 采集到的信息
+{collected_data}
+
+## 筛选标准（按方向）
+- A 技术方案：创新性30% + 可复现性35% + 难度适中25% + 时效性10%
+- B1 行业+市场：数据可靠性25% + 时效性25% + 规模增速20% + 竞争格局20% + PEST完整性10%
+- B2 市场量化：数据完整性30% + TAM/SAM/SOM测算25% + 细分市场规模25% + 时效性20%
+- C 学术综述：研究空白35% + 引用影响力25% + 时效性25% + 方法代表性15%
+- D 竞品分析：功能覆盖30% + 社区活跃度25% + 上手成本25% + 生态成熟度20%
+- E 政策趋势：政策力度30% + 落地进展35% + 覆盖范围20% + 时效性15%
+
+## 输出要求
+1. 按标准评估，输出Top 3-5推荐项
+2. 每项附评分（百分制）和推荐理由
+3. 标注关键数据来源
+4. 列出缺失数据（标注"需补充"）
+5. 明确最终核心结论
+
+铁律：绝不编造数据，来源必须附URL，估算值必须透明标注。"""
+
+
+def screening_decision(state: ResearchFlowState, llm: ChatOpenAI) -> dict:
+    """数据筛选与质量评估"""
+    parsed = state["parsed"]
+    direction = parsed.get("direction", "B1")
+    questions = parsed.get("questions", [])
+    collected = state.get("collected_data", "")
+
+    prompt = _SCREENING_PROMPT.format(
+        direction=direction,
+        questions="\n".join(f"- {q}" for q in questions),
+        collected_data=collected[:15000],  # 截断避免超长
+    )
+
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        content = response.content if isinstance(response.content, str) else str(response.content)
+        logger.info(f"筛选决策完成: content_length={len(content)}")
+        return {"screening_result": content}
+    except Exception as e:
+        logger.error(f"筛选决策失败: {e}")
+        return {
+            "screening_result": "筛选评估跳过（处理异常），直接使用采集数据。",
+            "error": f"筛选决策异常: {str(e)}",
+        }
+
+
+# ============================================================================
+# Node 4: 方案设计
+# ============================================================================
+
+_SOLUTION_DESIGN_PROMPT = """你是调研方案设计器。请根据筛选结果设计完整调研方案框架。
+
+## 调研方向
+{direction}
+
+## 使用的模板
+{template}
+
+## 筛选结论
+{screening_result}
+
+## 采集到的数据
+{collected_data}
+
+## 讲稿模板
+
+### 模板A1（技术深度型）
+行业背景 → 是什么 → 发展趋势 → 方案对比 → 行业痛点 → 我们的方案 → 效果 → 创新点 → 市场价值
+
+### 模板A2（应用展示型）
+行业背景 → 政策背景 → 行业痛点 → 我们的方案 → 创新点 → 效果对比 → 项目成果 → 应用价值
+
+### 模板B1（行业+市场型）
+行业定义与阶段 → PEST宏观环境（政治/经济/社会/技术，各一句话定性） → 波特五力竞争分析（每力一句话定性） → 市场规模（TAM/SAM/SOM，附测算方法和假设） → 历年市场规模表格（含增速） → STP市场细分（细分维度/目标选择/定位） → 渗透率与市场阶段 → 产业链拆解 → 竞争格局（梯队/份额/集中度，不做产品横向对比） → 关键玩家 → 驱动因素（技术/需求/资本） → 行业痛点与挑战（重点章节） → 风险与挑战 → 趋势判断
+注：政策原文和领导人讲话见政策趋势方向（E），竞品功能/参数对比见竞品分析方向（D）
+
+### 模板B2（市场量化型）
+TAM/SAM/SOM三层测算（附公式+假设+数据来源） → 历年市场规模数据表 → 细分市场量化（按用户/产品/地区拆分+各自规模） → 渗透率分析 → 竞争集中度（CR3/CR5/CR10） → 增长驱动因素量化 → 市场进入壁垒 → 风险量化
+
+### 模板C（学术综述型）
+研究背景 → 主流方法演进 → 代表工作对比 → 研究空白 → 未来方向 → 我们的研究切入点
+
+### 模板D（竞品分析型）
+需求定义 → 候选方案筛选 → 多维对比 → 优劣势矩阵 → 推荐方案 → 迁移路径
+注：不写市场规模数据、不写行业全景、不写政策分析、不写产业链结构，纯做产品横向对比
+
+### 模板E（政策趋势型）
+政策背景 → 核心政策原文引用（含时间/机构/要点） → 领导人讲话与名人名言（重点章节） → 受益/受限环节（一句话） → 国际对比（一句话） → 风险提示
+注：不写市场规模数据、不写产业链分析、不做市场预测
+
+## 输出要求
+1. 严格按照选定模板结构展开
+2. 每个章节写清楚核心要点（3-5条）
+3. 紧密结合数据和筛选结论
+4. 每个论点附数据或引用支撑
+5. 遵循"发现问题→解决问题"逻辑
+6. 来源标注格式：[来源名称](URL)
+7. 缺失数据标注"需补充"
+
+输出 Markdown 格式的完整方案框架大纲。"""
+
+
+def solution_design(state: ResearchFlowState, llm: ChatOpenAI) -> dict:
+    """按模板设计讲稿框架"""
+    parsed = state["parsed"]
+    direction = parsed.get("direction", "B1")
+    template = state.get("template") or parsed.get("template") or direction
+    screening = state.get("screening_result", "")
+    collected = state.get("collected_data", "")
+
+    prompt = _SOLUTION_DESIGN_PROMPT.format(
+        direction=direction,
+        template=template,
+        screening_result=screening[:8000],
+        collected_data=collected[:8000],
+    )
+
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        content = response.content if isinstance(response.content, str) else str(response.content)
+        logger.info(f"方案设计完成: content_length={len(content)}")
+        return {"solution_framework": content}
+    except Exception as e:
+        logger.error(f"方案设计失败: {e}")
+        return {
+            "solution_framework": "方案设计跳过（处理异常），直接进入成果输出。",
+            "error": f"方案设计异常: {str(e)}",
+        }
+
+
+# ============================================================================
+# Node 5: 成果输出
+# ============================================================================
+
+_OUTPUT_GENERATION_PROMPT = """你是调研成果生成器。请根据方案框架，生成完整调研报告和PPT提示词。
+
+## 方案框架
+{solution_framework}
+
+## 采集数据
+{collected_data}
+
+## 【强制要求】数据使用规则
+你必须严格按以下规则使用采集数据：
+1. **市场规模章节**：从采集数据的 "market_data" 或 "yearly_data" 字段中提取历年数据，逐一填入表格，不能留空或编造
+2. **竞品分析章节**：从采集数据的 "competitive_products" 或 "competing_products" 字段中提取每个竞品的名称、价格、核心参数，逐一填入表格
+3. **痛点章节**：从采集数据的 "pain_points" 或 "product_pain_points" 字段中提取每条痛点，逐一列出
+4. **如果上述字段存在JSON数据，优先使用JSON中的数据**，不要用自己训练知识重新生成
+5. **如果采集数据中没有某字段，才用自己的知识，但必须标注"需补充"**
+
+## 铁律提醒
+1. 绝不编造数据，没有的写"未给出"
+2. 每条关键数据附来源：[来源名称](URL)
+3. 估算值标注⚠️并附公式+参数来源+假设
+4. 超过2年数据标注年份
+
+## 输出内容
+
+### 第一部分：调研报告全文（Markdown）
+
+按方案框架展开完整报告，要求：
+- 每个章节内容充实，不是一句话概括
+- 数据全部附来源标注
+- 逻辑连贯，章节间有过渡
+- 结论明确，不含糊
+- **行业痛点与挑战章节必须深入**：不能泛泛而谈，每条痛点要有具体案例、数据或用户反馈支撑
+- **市场规模章节必须包含历年数据表格**（近5年），格式如下：
+
+```markdown
+| 年份 | 全球市场规模(亿元) | 中国市场规模(亿元) | 同比增长率 | 数据来源 |
+|------|-------------------|-------------------|-----------|---------|
+| 2021 | xx | xx | xx% | [来源](URL) |
+| 2022 | xx | xx | xx% | [来源](URL) |
+| 2023 | xx | xx | xx% | [来源](URL) |
+| 2024 | xx | xx | xx% | [来源](URL) |
+| 2025 | xx | xx | xx% | [来源](URL) |
+| 2026E | xx | xx | xx% | [来源](URL) |
+| 2030E | xx | xx | xx% | [来源](URL) |
+```
+
+> 注：E表示预测值。如某些年份数据无法获取，标注"未给出"，绝不允许编造。
+
+### 第二部分：PPT提示词
+
+为每一页PPT生成：
+```
+第X页：[页面标题]
+- 要点1：xxx
+- 要点2：xxx
+- 要点3：xxx
+- 布局建议：[左右分栏/上下结构/表格/图表/全图]
+- 视觉建议：[配什么类型的图/用什么颜色调性]
+```
+
+**必含页面**：市场规模趋势页（用历年数据做折线图/柱状图）、行业痛点页（痛点清单+严重程度可视化）
+
+### 第三部分：附录 - 信息来源表
+
+| 序号 | 内容 | 来源 | URL | 可靠性评级 |
+|------|------|------|-----|-----------|
+| 1 | xxx | xxx | [链接](URL) | ★★★★★ |
+
+可靠性评级：★★★★★官方原文 / ★★★★权威机构 / ★★★第三方平台 / ★★转载需核实 / ★未验证
+"""
+
+
+def output_generation(state: ResearchFlowState, llm: ChatOpenAI) -> dict:
+    """生成最终报告 + PPT提示词 + 参考文献"""
+    framework = state.get("solution_framework", "")
+    collected = state.get("collected_data", "")
+
+    prompt = _OUTPUT_GENERATION_PROMPT.format(
+        solution_framework=framework[:10000],
+        collected_data=collected[:10000],
+    )
+
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        content = response.content if isinstance(response.content, str) else str(response.content)
+        logger.info(f"成果输出完成: content_length={len(content)}")
+
+        # 尝试拆分三个部分
+        report = content
+        ppt_prompt = ""
+        references = ""
+
+        if "### 第二部分" in content:
+            parts = content.split("### 第二部分")
+            report = parts[0].strip()
+            rest = parts[1]
+            if "### 第三部分" in rest:
+                ppt_prompt = rest.split("### 第三部分")[0].strip()
+                references = rest.split("### 第三部分")[1].strip()
+            else:
+                ppt_prompt = rest.strip()
+        elif "## 第二部分" in content:
+            parts = content.split("## 第二部分")
+            report = parts[0].strip()
+            rest = parts[1]
+            if "## 第三部分" in rest:
+                ppt_prompt = rest.split("## 第三部分")[0].strip()
+                references = rest.split("## 第三部分")[1].strip()
+            else:
+                ppt_prompt = rest.strip()
+
+        return {
+            "report": report,
+            "ppt_prompt": ppt_prompt,
+            "references": references,
+        }
+
+    except Exception as e:
+        logger.error(f"成果输出失败: {e}")
+        return {
+            "report": f"成果生成异常，以下是原始框架:\n{framework}",
+            "ppt_prompt": "",
+            "references": "",
+            "error": f"成果输出异常: {str(e)}",
+        }
+
+
+# ============================================================================
+# 编译工作流
+# ============================================================================
+
+def build_research_flow(llm: ChatOpenAI):
+    """编译并返回 ResearchFlow 工作流图"""
+    workflow = StateGraph(ResearchFlowState)
+
+    # 添加节点
+    workflow.add_node("topic_parser", partial(topic_parser, llm=llm))
+    workflow.add_node("collect_data", partial(collect_data, llm=llm))
+    workflow.add_node("screening", partial(screening_decision, llm=llm))
+    workflow.add_node("solution_design", partial(solution_design, llm=llm))
+    workflow.add_node("output_generation", partial(output_generation, llm=llm))
+
+    # 设置边
+    workflow.add_edge(START, "topic_parser")
+    workflow.add_edge("topic_parser", "collect_data")
+    workflow.add_edge("collect_data", "screening")
+    workflow.add_edge("screening", "solution_design")
+    workflow.add_edge("solution_design", "output_generation")
+    workflow.add_edge("output_generation", END)
+
+    return workflow.compile()
