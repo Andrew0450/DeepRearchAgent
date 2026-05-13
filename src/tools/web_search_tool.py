@@ -8,16 +8,16 @@ from coze_coding_utils.runtime_ctx.context import new_context
 
 
 @tool
-def web_search(query: str, count: int = 5) -> str:
+def web_search(query: str, count: int = 10) -> str:
     """
     执行网络搜索，获取相关信息源URL和摘要。
 
     参数:
         query: 搜索查询关键词，用于查找相关信息
-        count: 返回结果数量，默认5条（建议不超过10条）
+        count: 返回结果数量，默认10条
 
     返回:
-        格式化的搜索结果，包含标题、URL、摘要等信息
+        格式化的搜索结果，包含标题、来源网站、URL、摘要等信息
     """
     ctx = new_context(method="search.web")
     client = SearchClient(ctx=ctx)
@@ -30,12 +30,10 @@ def web_search(query: str, count: int = 5) -> str:
 
         results = []
         for i, item in enumerate(response.web_items, 1):
-            # 限制摘要长度，避免输出过长
-            snippet = item.snippet[:200] + "..." if len(item.snippet) > 200 else item.snippet
             result = f"""[{i}] {item.title}
 来源: {item.site_name}
 URL: {item.url}
-摘要: {snippet}"""
+摘要: {item.snippet}"""
             results.append(result)
 
         return "\n\n".join(results)
@@ -45,13 +43,13 @@ URL: {item.url}
 
 
 @tool
-def image_search(query: str, count: int = 5) -> str:
+def image_search(query: str, count: int = 10) -> str:
     """
     执行图片搜索，获取相关图片URL。
 
     参数:
         query: 搜索查询关键词
-        count: 返回结果数量，默认5条
+        count: 返回结果数量，默认10条
 
     返回:
         格式化的图片搜索结果
