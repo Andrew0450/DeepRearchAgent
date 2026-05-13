@@ -13,6 +13,7 @@ from coze_coding_utils.runtime_ctx.context import default_headers, new_context
 from storage.memory.memory_saver import get_memory_saver
 from tools.web_search_tool import web_search
 from tools.fetch_url_tool import fetch_url_content
+from tools.document_generation_tool import generate_docx_report
 
 
 LLM_CONFIG = "config/agent_llm_config.json"
@@ -48,7 +49,7 @@ def build_agent(ctx=None):
     )
 
     # 注册工具
-    tools = [web_search, fetch_url_content]
+    tools = [web_search, fetch_url_content, generate_docx_report]
 
     return create_agent(
         model=llm,
